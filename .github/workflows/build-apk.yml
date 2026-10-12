@@ -1,0 +1,271 @@
+# On every push to main (or by hand from the Actions tab):
+#   1. "Server"  - sets up / updates the Supabase project (database, functions, settings)
+#   2. "APK"     - builds the Android app and attaches it to a GitHub Release
+#   3. "Web"     - builds the same app for a computer's browser (zip on the release, and an artifact)
+#
+# Repository secrets (Settings → Secrets and variables → Actions):
+#   SUPABASE_ACCESS_TOKEN  Supabase → Account → Access Tokens
+#   SUPABASE_PROJECT_REF   the project id, e.g. abcdefghijklmnop
+#   KEYSTORE_BASE64        release signing key (base64 of the .jks file)
+#   KEYSTORE_PASSWORD      its password
+# Optional, for push notifications:
+#   FIREBASE_CONFIG            contents of google-services.json (Firebase → Project settings → Your apps)
+#   FIREBASE_SERVICE_ACCOUNT   service account key JSON (Firebase → Project settings → Service accounts)
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+  PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+
+jobs:
+  server:
+    name: Server (Supabase)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check Supabase secrets
+        id: check
+        run: |
+          if [ -z "$SUPABASE_ACCESS_TOKEN" ] || [ -z "$PROJECT_REF" ]; then
+            echo "::warning::SUPABASE_ACCESS_TOKEN / SUPABASE_PROJECT_REF secrets missing - server setup skipped."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: supabase/setup-cli@v1
+        if: steps.check.outputs.ready == 'true'
+        with:
+          version: latest
+
+      - name: Set up / update Supabase
+        if: steps.check.outputs.ready == 'true'
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: bash scripts/supabase-deploy.sh
+
+  apk:
+    name: APK
+    needs: server
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - run: flutter test
+
+      - name: Set up signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::warning::KEYSTORE_BASE64 / KEYSTORE_PASSWORD secrets missing - using a temporary debug key. Phones will not accept later updates over this build."
+            exit 0
+          fi
+          # Forgive common copy-paste slips: spaces/line breaks in the key text, and
+          # "KEYSTORE_PASSWORD=" or a second line copied along with the password.
+          password=$(printf '%s\n' "$KEYSTORE_PASSWORD" | head -n 1 | tr -d '\r' |
+            sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^KEYSTORE_PASSWORD=//')
+          printf '%s' "$KEYSTORE_BASE64" | tr -d ' \t\r\n' | base64 -d > android/app/release.jks || true
+
+          if ! keytool -list -keystore android/app/release.jks -storepass "$password" >/dev/null 2>&1; then
+            echo "::error title=Signing key::KEYSTORE_PASSWORD secret is wrong. Paste only the part after KEYSTORE_PASSWORD= from keystore-password.txt."
+            exit 1
+          fi
+          {
+            echo "storeFile=app/release.jks"
+            echo "storePassword=$password"
+            echo "keyAlias=whatsweb"
+            echo "keyPassword=$password"
+          } > android/key.properties
+
+      - name: Get server address
+        id: server
+        run: |
+          url=""
+          key=""
+          if [ -n "$SUPABASE_ACCESS_TOKEN" ] && [ -n "$PROJECT_REF" ]; then
+            url="https://$PROJECT_REF.supabase.co"
+            # The publishable (or legacy anon) key is meant to be inside apps; data is protected by RLS.
+            key=$(curl -sS --fail-with-body \
+              -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+              "https://api.supabase.com/v1/projects/$PROJECT_REF/api-keys" |
+              jq -r '(map(select(.type == "publishable")) | .[0].api_key) // (map(select(.name == "anon")) | .[0].api_key) // empty')
+          fi
+          if [ -z "$url" ] || [ -z "$key" ]; then
+            echo "::warning::No Supabase project connected - the app will show a 'not configured' screen."
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Read Firebase settings
+        id: firebase
+        env:
+          FIREBASE_CONFIG: ${{ secrets.FIREBASE_CONFIG }}
+        run: |
+          if [ -z "$FIREBASE_CONFIG" ]; then
+            echo "FIREBASE_CONFIG secret not set - push notifications stay off"
+            exit 0
+          fi
+          cfg=$(printf '%s' "$FIREBASE_CONFIG")
+          client='(.client | map(select(.client_info.android_client_info.package_name == "com.whatsweb.app")) | .[0] // .[0])'
+          {
+            echo "api_key=$(jq -r "$client.api_key[0].current_key // empty" <<< "$cfg")"
+            echo "app_id=$(jq -r "$client.client_info.mobilesdk_app_id // empty" <<< "$cfg")"
+            echo "sender_id=$(jq -r '.project_info.project_number // empty' <<< "$cfg")"
+            echo "project_id=$(jq -r '.project_info.project_id // empty' <<< "$cfg")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build APK
+        env:
+          SUPABASE_URL: ${{ steps.server.outputs.url }}
+          SUPABASE_KEY: ${{ steps.server.outputs.key }}
+        run: |
+          set -o pipefail
+          # Real phones only (32/64-bit ARM): leaving out emulator code keeps the APK smaller.
+          if ! flutter build apk --release \
+            --target-platform android-arm,android-arm64 \
+            --build-number=${{ github.run_number }} \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_KEY="$SUPABASE_KEY" \
+            --dart-define=FIREBASE_API_KEY="${{ steps.firebase.outputs.api_key }}" \
+            --dart-define=FIREBASE_APP_ID="${{ steps.firebase.outputs.app_id }}" \
+            --dart-define=FIREBASE_SENDER_ID="${{ steps.firebase.outputs.sender_id }}" \
+            --dart-define=FIREBASE_PROJECT_ID="${{ steps.firebase.outputs.project_id }}" 2>&1 | tee build.log; then
+            # Put the reason in the run summary (annotations), not only in the long log.
+            reason=$(grep -E -A30 "What went wrong|error:|Error:|e: " build.log | head -120 |
+              sed -e 's/%/%25/g' -e 's/\r/%0D/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=APK build failed::${reason:-see log}"
+            exit 1
+          fi
+          mv build/app/outputs/flutter-apk/app-release.apk whatsweb-build-${{ github.run_number }}.apk
+
+      - name: Publish for in-app update
+        if: ${{ steps.server.outputs.url != '' }}
+        # A failed upload must not stop the GitHub release below.
+        continue-on-error: true
+        run: |
+          if [ ! -f android/key.properties ]; then
+            echo "::warning::Not signed with the release key - skipping the in-app update upload."
+            exit 0
+          fi
+          api="https://api.supabase.com/v1/projects/$PROJECT_REF"
+          # Server-side key, only used here to upload the file; never goes into the app.
+          service_key=$(curl -sS --fail-with-body -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" "$api/api-keys?reveal=true" |
+            jq -r '(map(select(.type == "secret")) | .[0].api_key) // (map(select(.name == "service_role")) | .[0].api_key) // empty')
+          echo "::add-mask::$service_key"
+          auth=()
+          case "$service_key" in eyJ*) auth=(-H "Authorization: Bearer $service_key") ;; esac
+          curl -sS --fail-with-body -X POST \
+            "${{ steps.server.outputs.url }}/storage/v1/object/app/whatsweb.apk" \
+            -H "apikey: $service_key" "${auth[@]}" \
+            -H "Content-Type: application/vnd.android.package-archive" \
+            -H "x-upsert: true" \
+            --data-binary @whatsweb-build-${{ github.run_number }}.apk > /dev/null
+          jq -n --arg q "insert into public.app_settings (key, value)
+                values ('app_release', jsonb_build_object('build', ${{ github.run_number }}, 'file', 'whatsweb.apk', 'published_at', now()))
+                on conflict (key) do update set value = excluded.value, updated_at = now();" '{query: $q}' |
+            curl -sS --fail-with-body -X POST "$api/database/query" \
+              -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" -H "Content-Type: application/json" -d @- > /dev/null
+          echo "Build ${{ github.run_number }} is now offered inside the app."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whatsweb-apk
+          path: whatsweb-build-${{ github.run_number }}.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: WhatsWeb build ${{ github.run_number }}
+          body: |
+            Download the .apk below on your phone and install it.
+            Commit: ${{ github.sha }}
+          files: whatsweb-build-${{ github.run_number }}.apk
+
+  web:
+    name: Web
+    needs: [server, apk]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Get server address
+        id: server
+        run: |
+          url=""
+          key=""
+          if [ -n "$SUPABASE_ACCESS_TOKEN" ] && [ -n "$PROJECT_REF" ]; then
+            url="https://$PROJECT_REF.supabase.co"
+            # The publishable (or legacy anon) key is meant to be inside apps; data is protected by RLS.
+            key=$(curl -sS --fail-with-body \
+              -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+              "https://api.supabase.com/v1/projects/$PROJECT_REF/api-keys" |
+              jq -r '(map(select(.type == "publishable")) | .[0].api_key) // (map(select(.name == "anon")) | .[0].api_key) // empty')
+          fi
+          if [ -z "$url" ] || [ -z "$key" ]; then
+            echo "::warning::No Supabase project connected - the web app will show a 'not configured' screen."
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Build web
+        env:
+          SUPABASE_URL: ${{ steps.server.outputs.url }}
+          SUPABASE_KEY: ${{ steps.server.outputs.key }}
+        run: |
+          set -o pipefail
+          if ! flutter build web --release \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_KEY="$SUPABASE_KEY" 2>&1 | tee build.log; then
+            reason=$(grep -E -A30 "Error:|error:|Failed" build.log | head -120 |
+              sed -e 's/%/%25/g' -e 's/\r/%0D/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=Web build failed::${reason:-see log}"
+            exit 1
+          fi
+          (cd build/web && zip -qr ../../whatsweb-web-build-${{ github.run_number }}.zip .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whatsweb-web
+          path: build/web
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: WhatsWeb build ${{ github.run_number }}
+          files: whatsweb-web-build-${{ github.run_number }}.zip

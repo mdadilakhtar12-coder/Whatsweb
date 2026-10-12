@@ -1,0 +1,96 @@
+<!doctype html>
+<!--
+  Sample landing page form that sends leads straight into the CRM.
+  1. Replace WEBHOOK_URL below with:
+       https://<PROJECT_REF>.supabase.co/functions/v1/lead-webhook?key=<LANDING_KEY>
+  2. In your ads, add to the landing page link:
+       Meta:   ?utm_source=facebook&utm_campaign={{campaign.name}}
+       Google: ?utm_source=google&utm_campaign={campaignid}
+     The CRM then shows whether the lead came from Meta or Google.
+  Any website form can do the same: POST fields named name, phone, email (+ anything else).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Enquire Now</title>
+  <style>
+    :root { --brand: #1e5eff; --text: #172033; --muted: #5b6477; --bg: #f5f7fb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+    main { max-width: 440px; margin: 0 auto; padding: 32px 16px; }
+    h1 { font-size: 26px; margin: 0 0 8px; }
+    p { color: var(--muted); margin: 0 0 24px; line-height: 1.5; }
+    form { background: #fff; border-radius: 16px; padding: 20px; box-shadow: 0 4px 24px rgba(20, 30, 60, .08); }
+    label { display: block; font-weight: 600; font-size: 14px; margin: 14px 0 6px; }
+    input, select { width: 100%; padding: 12px 14px; font-size: 16px; border: 1px solid #d5dae5; border-radius: 10px; }
+    input:focus, select:focus { outline: 2px solid var(--brand); border-color: transparent; }
+    button { width: 100%; margin-top: 20px; padding: 14px; font-size: 17px; font-weight: 700; color: #fff; background: var(--brand); border: 0; border-radius: 10px; }
+    button:disabled { opacity: .6; }
+    .hp { position: absolute; left: -9999px; }
+    .done { text-align: center; padding: 32px 8px; }
+    .error { color: #c62828; font-size: 14px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Get course details</h1>
+  <p>Leave your details and our counsellor will call you shortly.</p>
+
+  <form id="lead-form" method="POST">
+    <label for="name">Your name</label>
+    <input id="name" name="name" autocomplete="name" required>
+
+    <label for="phone">Mobile number</label>
+    <input id="phone" name="phone" type="tel" inputmode="numeric" pattern="[0-9+ -]{10,15}" autocomplete="tel" required>
+
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="email">
+
+    <label for="course">Course</label>
+    <select id="course" name="course">
+      <option value="">Select</option>
+      <option>Course A</option>
+      <option>Course B</option>
+    </select>
+
+    <!-- filled from the page URL -->
+    <input type="hidden" name="utm_source">
+    <input type="hidden" name="utm_campaign">
+    <input type="hidden" name="page">
+    <!-- bots fill this, people don't -->
+    <input class="hp" name="_gotcha" tabindex="-1" autocomplete="off">
+
+    <button type="submit">Submit</button>
+    <div class="error" id="error" hidden></div>
+  </form>
+</main>
+
+<script>
+  const WEBHOOK_URL = 'https://PROJECT_REF.supabase.co/functions/v1/lead-webhook?key=LANDING_KEY';
+
+  const form = document.getElementById('lead-form');
+  const params = new URLSearchParams(location.search);
+  form.utm_source.value = params.get('utm_source') || (params.get('fbclid') ? 'facebook' : params.get('gclid') ? 'google' : '');
+  form.utm_campaign.value = params.get('utm_campaign') || '';
+  form.page.value = location.pathname;
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const button = form.querySelector('button');
+    const error = document.getElementById('error');
+    button.disabled = true;
+    error.hidden = true;
+    try {
+      const res = await fetch(WEBHOOK_URL, { method: 'POST', body: new URLSearchParams(new FormData(form)) });
+      if (!res.ok) throw new Error((await res.json()).error || 'Please try again');
+      form.outerHTML = '<div class="done"><h2>Thank you! 🎉</h2><p>We will call you soon.</p></div>';
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+      button.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

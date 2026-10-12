@@ -1,0 +1,36 @@
+# Used by the Supabase CLI when deploying the edge functions.
+# The functions check their own keys/tokens, so Supabase's JWT check is switched off.
+project_id = "whatsweb"
+
+[functions.admin-users]
+verify_jwt = false
+
+[functions.lead-webhook]
+verify_jwt = false
+
+[functions.meta-leads]
+verify_jwt = false
+
+[functions.push]
+verify_jwt = false
+
+[functions.backup]
+verify_jwt = false
+
+[functions.whatsapp]
+verify_jwt = false
+
+[functions.whatsapp-webhook]
+verify_jwt = false
+
+[functions.webinar-gg]
+verify_jwt = false
+
+[functions.api]
+verify_jwt = false
+
+[functions.appx]
+verify_jwt = false
+
+[functions.crm-mcp]
+verify_jwt = false
